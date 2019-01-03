@@ -19,7 +19,7 @@ class modified_dir:
             self.epsilon = max_eps
         elif epsilon < 0:
 
-            print "[mDir Warning] MDir(): espilon is negative, reset to 0."
+            print("[mDir Warning] MDir(): espilon is negative, reset to 0.")
             self.epsilon = 0
         else:
             self.epsilon = epsilon

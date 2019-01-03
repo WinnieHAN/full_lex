@@ -13,12 +13,13 @@ import m_dir
 
 
 class ml_dmv_model(nn.Module):
-    def __init__(self, pos, sentence_map, language_map, data_size, options):
+    def __init__(self, pos, words, sentence_map, language_map, data_size, options):
         super(ml_dmv_model, self).__init__()
         self.options = options
         self.count_smoothing = options.count_smoothing
         self.param_smoothing = options.param_smoothing
         self.pos = pos
+        self.words = words
         self.sentence_map = sentence_map
         self.language_map = language_map
         # self.decision_pos = {}
@@ -47,9 +48,12 @@ class ml_dmv_model(nn.Module):
         self.root_counter = np.zeros(len(pos.keys()))
         self.decision_counter = np.zeros((len(pos.keys()), 2, options.d_valency, 2))  # p d v stop
 
-        self.sentence_trans_param = np.zeros((data_size, len(pos.keys()), len(pos.keys()), 2, self.cvalency))  # p
-        self.sentence_root_param = np.zeros((data_size, len(pos.keys())))
-        self.sentence_decision_param = np.zeros((data_size, len(pos.keys()), 2, self.dvalency, 2))
+        # self.sentence_trans_param = np.zeros((data_size, len(pos.keys()), len(pos.keys()), 2, self.cvalency))  # p
+        # self.sentence_root_param = np.zeros((data_size, len(pos.keys())))
+        # self.sentence_decision_param = np.zeros((data_size, len(pos.keys()), 2, self.dvalency, 2))
+        self.sentence_trans_param = np.zeros((data_size, options.train_stc_length, options.train_stc_length, self.cvalency))  # p
+        self.sentence_root_param = np.zeros((data_size, options.train_stc_length))
+        self.sentence_decision_param = np.zeros((data_size, options.train_stc_length, self.dvalency, 2))  # h v stop
 
         # p_counter = 0
         for p in pos.keys():
@@ -215,41 +219,49 @@ class ml_dmv_model(nn.Module):
                     es = ratio
         return es
 
-    def em_e(self, batch_pos, batch_lan, batch_sen, em_type, epoch):
-        batch_pos = np.array(batch_pos)
+    def em_e(self, batch_token, batch_lan, batch_sen, em_type, epoch):
+        # batch_token = np.array(batch_token)
         if em_type == 'viterbi':
-            # batch_likelihood = self.run_viterbi_estep(batch_pos, batch_lan, batch_sen, trans_counter,
-            #                                           decision_counter)
-            pass
+            batch_likelihood = self.run_viterbi_estep(batch_token, batch_lan, batch_sen, epoch)
         elif em_type == 'em':
-            batch_likelihood = self.run_em_estep(batch_pos, batch_lan, batch_sen, epoch)
+            batch_likelihood = self.run_em_estep(batch_token, batch_lan, batch_sen, epoch)
 
         return batch_likelihood
 
-    def run_viterbi_estep(self, batch_pos, batch_words, batch_sen, trans_counter, decision_counter, lex_counter):
-        batch_size = len(batch_pos)
-        batch_score, batch_decision_score = self.evaluate_batch_score(batch_words, batch_pos)
-        batch_score = np.array(batch_score)
-        batch_decision_score = np.array(batch_decision_score)
-        batch_score[:, :, 0, :, :, :] = -np.inf
-        if self.specify_splitting:
-            batch_score, batch_decision_score = self.mask_scores(batch_score, batch_decision_score, batch_pos)
-        if self.function_mask:
-            batch_score = self.function_to_mask(batch_score, batch_pos)
-
-        best_parse = eisner_for_dmv.batch_parse(batch_score, batch_decision_score, self.dvalency, self.cvalency)
-
-        batch_likelihood = self.update_counter(best_parse, trans_counter, decision_counter, lex_counter, batch_pos,
-                                               batch_words)
-
-        self.trans_counter = trans_counter
-        return batch_likelihood
-
-    def run_em_estep(self, batch_pos, batch_lan, batch_sen, epoch):
-        batch_score, batch_root_score, batch_decision_score = self.evaluate_batch_score(batch_pos, batch_sen, self.sentence_trans_param, epoch)
+    def run_viterbi_estep(self, batch_token, batch_lan, batch_sen, epoch):
+        batch_score, batch_root_score, batch_decision_score = self.evaluate_batch_score(batch_token, batch_sen, self.sentence_trans_param, epoch)
         batch_score = np.array(batch_score)  # log p : batch_size, sentence_length, _, v_c_num
         batch_root_score = np.array(batch_root_score)
         batch_decision_score = np.array(batch_decision_score)
+        batch_pos = [s[0] for s in batch_token]
+        batch_word = [s[1] for s in batch_token]
+        if self.function_mask:
+            batch_score = self.function_to_mask(batch_score, batch_pos)
+        batch_size, sentence_length, _, v_c_num = batch_score.shape
+        _, _, _, v_d_num, _ = batch_decision_score.shape
+        # partial code is consistent with eisner_for_dmv.py (only child decision without root)
+        batch_score = np.concatenate((np.full((batch_size, 1, sentence_length, v_c_num), -np.inf), batch_score),axis=1)# for eisner
+        batch_score = np.concatenate((np.full((batch_size, sentence_length+1, 1, v_c_num), -np.inf), batch_score),axis=2)# for eisner
+        batch_score[:, 0, 1:, 0] = batch_root_score
+        batch_score[:, 0, 1:, 1] = batch_root_score
+        batch_decision_score = np.concatenate((np.zeros((batch_size, 1, 2, v_d_num, 2)), batch_decision_score), axis=1)#np.concatenate((np.full((batch_size, 1, 2, v_d_num, 2), 0), batch_decision_score), axis=1)
+
+        batch_score = batch_score.reshape(batch_size, sentence_length+1, sentence_length+1, 1, 1, self.cvalency)
+        batch_decision_score = batch_decision_score.reshape(batch_size, sentence_length+1, 1, 2, self.dvalency, 2)
+        best_parse = eisner_for_dmv.batch_parse(batch_score, batch_decision_score, self.dvalency, self.cvalency)
+        # update count and samples. direction of root is RIGHT, so dir is 1.
+        batch_pos_add_root = np.array([[self.trans_counter.shape[0]] + list(i) for i in batch_pos])
+        batch_word_add_root = np.array([[len(self.words)] + list(i) for i in batch_word])
+        batch_likelihood = self.update_counter(best_parse, self.trans_counter, self.root_counter, self.decision_counter, batch_pos_add_root, batch_word_add_root, batch_sen, batch_lan)
+        return batch_likelihood
+
+    def run_em_estep(self, batch_token, batch_lan, batch_sen, epoch):
+        batch_score, batch_root_score, batch_decision_score = self.evaluate_batch_score(batch_token, batch_sen, self.sentence_trans_param, epoch)
+        batch_score = np.array(batch_score)  # log p : batch_size, sentence_length, sentence_length, v_c_num
+        batch_root_score = np.array(batch_root_score)
+        batch_decision_score = np.array(batch_decision_score)
+        batch_pos = [s[0] for s in batch_token]
+        batch_word = [s[1] for s in batch_token]
         if self.function_mask:
             batch_score = self.function_to_mask(batch_score, batch_pos)
         batch_size, sentence_length, _, v_c_num = batch_score.shape
@@ -269,20 +281,20 @@ class ml_dmv_model(nn.Module):
             eisner_for_dmv.batch_outside(inside_complete_table, inside_incomplete_table, inside_batch_score,
                                          inside_batch_decision_score, self.dvalency, self.cvalency)
         # update count and samples
-        # self.rule_samples.append(list([h_pos, m_pos, dir, v, sentence_id, language_id, count]))
-        # decision_counter
-        # trans_counter
         # trans_counter_temp = np.zeros((self.trans_counter.shape[0]+1, self.trans_counter.shape[1]+1, self.trans_counter.shape[2], self.trans_counter.shape[3]))
         batch_pos_add_root = np.array([[self.trans_counter.shape[0]] + list(i) for i in batch_pos])
+        batch_word_add_root = np.array([[len(self.words)] + list(i) for i in batch_word])
         batch_likelihood = self.update_pseudo_count(inside_incomplete_table, inside_complete_table, sentence_prob,
                                                     outside_incomplete_table, outside_complete_table, self.trans_counter, self.root_counter,
-                                                    self.decision_counter, batch_pos_add_root, batch_sen, batch_lan)
+                                                    self.decision_counter, batch_pos_add_root, batch_word_add_root, batch_sen, batch_lan)
         # self.root_counter += trans_counter_temp[0, 1:,1, 0]  # p c d v. direction of root is RIGHT, so dir is 1.
         # self.trans_counter += trans_counter_temp[1:, 1:, :, :]
         return batch_likelihood
 
-    def evaluate_batch_score(self, batch_pos, batch_sen, sentence_trans_param, epoch):
-        batch_size, sentence_length = batch_pos.shape
+    def evaluate_batch_score(self, batch_token, batch_sen, sentence_trans_param, epoch):
+        batch_size = len(batch_token)
+        sentence_length = len(batch_token[0][0])
+        batch_pos = [s[0] for s in batch_token]  # batch_word = [s[1] for s in batch_token]
         # batch,head,child,head_tag,child_tag
         scores = np.zeros((batch_size, sentence_length, sentence_length, self.cvalency))
         root_scores = np.zeros((batch_size, sentence_length))
@@ -309,69 +321,8 @@ class ml_dmv_model(nn.Module):
                     if self.initial_flag or epoch < self.non_neural_iter:  #TODO True: #
                         scores[s, i, j, :] = np.log(self.trans_param[h_pos_id, m_pos_id, dir, :])
                     else:
-                        scores[s, i, j, :] = np.log(sentence_trans_param[sentence_id, h_pos_id, m_pos_id, dir, :])
+                        scores[s, i, j, :] = np.log(sentence_trans_param[sentence_id, i, j, :])
         return scores, root_scores, decision_scores  # scores: batch, h, c, v  ;decision_scores: batch, h d v stop
-
-    def update_counter(self, best_parse, trans_counter, decision_counter, lex_counter, batch_pos, batch_words):
-        batch_likelihood = 0.0
-        for sen_id in range(len(batch_pos)):
-            pos_sentence = batch_pos[sen_id]
-            word_sentence = batch_words[sen_id]
-            heads = best_parse[0][sen_id]
-            tags = best_parse[1][sen_id]
-            head_valences = best_parse[2][sen_id]
-            valences = best_parse[3][sen_id]
-            for i, h in enumerate(heads):
-                m_tag_id = int(tags[i])
-                m_pos = pos_sentence[i]
-                if h == -1:
-                    continue
-                m_dec_pos = self.to_decision[m_pos]
-                m_head_valence = int(head_valences[i])
-                m_valence = valences[i]
-                if self.cvalency > 1:
-                    m_child_valence = m_head_valence
-                else:
-                    m_child_valence = 0
-                m_word = word_sentence[i]
-                h = int(h)
-                h_pos = pos_sentence[h]
-
-                if h < i:
-                    dir = 1
-                else:
-                    dir = 0
-                h_tag_id = int(tags[h])
-                trans_counter[h_pos, m_pos, h_tag_id, m_tag_id, dir, m_child_valence] += 1.
-                batch_likelihood += np.log(self.trans_param[h_pos, m_pos, h_tag_id, m_tag_id, dir, m_child_valence])
-                if self.use_neural:
-                    self.rule_samples.append(list([h_pos, m_pos, h_tag_id, m_tag_id, dir, m_child_valence]))
-                decision_counter[m_dec_pos, m_tag_id, 0, int(m_valence[0]), 0] += 1.
-                decision_counter[m_dec_pos, m_tag_id, 1, int(m_valence[1]), 0] += 1.
-                if self.use_neural:
-                    if not self.unified_network:
-                        self.decision_samples.append(list([m_dec_pos, m_tag_id, 0, int(m_valence[0]), 0]))
-                        self.decision_samples.append(list([m_dec_pos, m_tag_id, 1, int(m_valence[1]), 0]))
-                    else:
-                        self.decision_samples.append(list([m_pos, m_tag_id, 0, int(m_valence[0]), 0]))
-                        self.decision_samples.append(list([m_pos, m_tag_id, 1, int(m_valence[1]), 0]))
-                # lexicon count
-                if (self.use_lex):
-                    lex_counter[m_pos, m_tag_id, m_word] += 1
-                    batch_likelihood += np.log(self.lex_param[m_pos, m_tag_id, m_word])
-                if h > 0:
-                    h_dec_pos = self.to_decision[h_pos]
-                    decision_counter[h_dec_pos, h_tag_id, dir, m_head_valence, 1] += 1.
-                    if self.use_neural:
-                        if not self.unified_network:
-                            self.decision_samples.append(list([h_dec_pos, h_tag_id, dir, m_head_valence, 1]))
-                        else:
-                            self.decision_samples.append(list([h_pos, h_tag_id, dir, m_head_valence, 1]))
-                    batch_likelihood += np.log(self.decision_param[h_dec_pos, h_tag_id, dir, m_head_valence, 1])
-                batch_likelihood += np.log(self.decision_param[m_dec_pos, m_tag_id, 0, int(m_valence[0]), 0])
-                batch_likelihood += np.log(self.decision_param[m_dec_pos, m_tag_id, 1, int(m_valence[1]), 0])
-
-        return batch_likelihood
 
     def em_m(self, trans_counter, root_counter, decision_counter, lex_counter, child_model, decision_model):
         # if self.tag_num > 1:
@@ -387,14 +338,76 @@ class ml_dmv_model(nn.Module):
         self.root_param = root_counter / root_sum
         return
 
+    def update_counter(self, best_parse, trans_counter, root_counter, decision_counter, batch_pos, batch_word, batch_sen, batch_lan):
+        batch_likelihood = 0.0
+        batch_size, sentence_length = batch_pos.shape
+        for sen_id in range(batch_size):
+            pos_sentence = batch_pos[sen_id]
+            word_sentence = batch_word[sen_id]
+            heads = best_parse[0][sen_id]
+            tags = best_parse[1][sen_id]
+            head_valences = best_parse[2][sen_id]  # ?
+            valences = best_parse[3][sen_id]  # ?
+            sentence_id = batch_sen[sen_id]
+            language_id = batch_lan[sen_id]
+            for i, h in enumerate(heads):  # i: child position, h: head position
+                # m_tag_id = int(tags[i])
+                m_pos = pos_sentence[i]
+                m_word = word_sentence[i]
+                if h == -1:
+                    continue
+                m_dec_pos = m_pos
+                m_head_valence = int(head_valences[i])  # child valence
+                m_valence = valences[i]  # decision valence
+                if self.cvalency > 1:
+                    m_child_valence = m_head_valence
+                else:
+                    m_child_valence = 0
+                h = int(h)
+                h_pos = pos_sentence[h]
+                h_word = word_sentence[h]
+                if h < i:
+                    dir = 1
+                else:
+                    dir = 0
+                # h_tag_id = int(tags[h])  # h_tag_id, m_tag_id what is these TODO:hanwj ??
+                if h == 0:
+                    root_counter[m_pos] += 1
+                else:
+                    trans_counter[h_pos, m_pos, dir, m_child_valence] += 1.
+                    if self.use_neural:
+                        count = 1
+                        self.rule_samples.append(list([h_pos, h_word, h-1, m_pos, m_word, dir, m_child_valence, sentence_id, language_id, count]))
+
+                if h == 0:
+                    batch_likelihood += np.log(self.root_param[m_pos])
+                else:
+                    batch_likelihood += np.log(self.trans_param[h_pos, m_pos, dir, m_child_valence])
+                decision_counter[m_dec_pos, 0, int(m_valence[0]), 0] += 1.  # h_dec_pos, h_tag_id, dir, m_head_valence, 1
+                decision_counter[m_dec_pos, 1, int(m_valence[1]), 0] += 1.
+                self.decision_samples.append(list([m_pos, 0, int(m_valence[0]), 0]))
+                self.decision_samples.append(list([m_pos, 1, int(m_valence[1]), 0]))
+                batch_likelihood += np.log(self.decision_param[m_dec_pos, 0, int(m_valence[0]), 0])
+                batch_likelihood += np.log(self.decision_param[m_dec_pos, 1, int(m_valence[1]), 0])
+
+                if h > 0:
+                    h_dec_pos = h_pos
+                    decision_counter[h_dec_pos, dir, m_head_valence, 1] += 1.
+                    self.decision_samples.append(list([h_pos, dir, m_head_valence, 1]))
+                    batch_likelihood += np.log(self.decision_param[h_dec_pos, dir, m_head_valence, 1])
+
+
+        return batch_likelihood
+
     def update_pseudo_count(self, inside_incomplete_table, inside_complete_table, sentence_prob,
                             outside_incomplete_table, outside_complete_table, trans_counter, root_counter,
-                            decision_counter, batch_pos, batch_sen, batch_lan):
+                            decision_counter, batch_pos, batch_word, batch_sen, batch_lan):
         batch_likelihood = 0.0
         batch_size, sentence_length = batch_pos.shape
         span_2_id, id_2_span, ijss, ikcs, ikis, kjcs, kjis, basic_span = utils.constituent_index(sentence_length, False)
         for s in range(batch_size):
             pos_sentence = batch_pos[s]
+            word_sentence = batch_word[s]
             sentence_id = batch_sen[s]
             language_id = batch_lan[s]
             one_sentence_count = []
@@ -410,8 +423,10 @@ class ml_dmv_model(nn.Module):
                     else:
                         dir = 1
                     h_pos = pos_sentence[h]
+                    h_word = word_sentence[h]
 
                     m_pos = pos_sentence[m]
+                    m_word = word_sentence[m]
                     m_dec_pos = m_pos
                     if dir == 0:
                         span_id = span_2_id[(m, h, dir)]
@@ -435,7 +450,7 @@ class ml_dmv_model(nn.Module):
                         for v in range(self.cvalency):
                             count = np.exp(dep_count).reshape(self.cvalency)[v]
                             if not h == 0:
-                                self.rule_samples.append(list([h_pos, m_pos, dir, v, sentence_id, language_id, count]))
+                                self.rule_samples.append(list([h_pos, h_word, h-1, m_pos, m_word, dir, v, sentence_id, language_id, count]))  # TODO:hanwj  h-1
                     if h > 0:
                         h_dec_pos = h_pos
                         decision_counter[h_dec_pos, dir, :, 1] += np.exp(dep_count).reshape(self.cvalency)
@@ -516,7 +531,7 @@ class ml_dmv_model(nn.Module):
         batch_size, sentence_length, _, _ = batch_score.shape
         for s in range(batch_size):
             for i in range(sentence_length):
-                pos_id = batch_pos[s, i]
+                pos_id = batch_pos[s][i]
                 pos = self.id_to_pos[pos_id]
                 if pos in self.function_set:
                     batch_score[s, i, :, :] = -1e5#-np.inf

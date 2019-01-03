@@ -6,15 +6,12 @@ import utils
 import numpy as np
 from numpy import linalg as LA
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
-from allennlp.modules.elmo import Elmo, batch_to_ids
-
 
 
 class m_step_model(nn.Module):
-    def __init__(self, tag_num, word_num, lan_num, words, options):
+    def __init__(self, tag_num, lan_num, options):
         super(m_step_model, self).__init__()
         self.tag_num = tag_num
-        self.word_num = word_num
         self.options = options
         self.cvalency = options.c_valency
         self.dvalency = options.d_valency
@@ -24,27 +21,23 @@ class m_step_model(nn.Module):
         self.pembedding_dim = options.pembedding_dim
         self.valency_dim = options.valency_dim
         self.hid_dim = options.hid_dim
-        self.pre_output_dim = options.pre_output_dim  # child token dimention
-        self.pre_output_word_dim = options.pre_output_word_dim  # elmo dimention: 1024
+        self.pre_output_dim = options.pre_output_dim
         self.unified_network = options.unified_network
         self.decision_pre_output_dim = options.decision_pre_output_dim
         self.drop_out = options.drop_out
         self.lan_num = lan_num
-        self.ml_comb_type = options.ml_comb_type  # options.ml_comb_type = 0(no_lang_id)/1(id embeddings)/2(classify-tags)
+        self.ml_comb_type = options.ml_comb_type  # options.ml_comb_type = 0(no_lang_id)/1(id embeddings)/2(classify-tags)/3(joint_training)/4(joint-learning-and-two-channel)
         self.stc_model_type = options.stc_model_type  # 1  lstm   2 lstm with atten   3 variational
         self.non_dscrm_iter = options.non_dscrm_iter
+        self.channel_type = options.channel_type
+        self.channel_add_lang_cls = options.channel_add_lang_cls
 
-        self.full_lex = options.full_lex
-        self.input_word_dim = options.input_word_dim
-        self.options_file = '/home/hanwj/Code/l_dmv/data/elmo/elmo_2x4096_512_2048cnn_2xhighway_options.json'  # "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
-        self.weight_file = '/home/hanwj/Code/l_dmv/data/elmo/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5'  # "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
-        self.elmo = Elmo(self.options_file, self.weight_file, 2, dropout=0, requires_grad=False)
-        self.i2word = {p: i for i, p in words.items()}
+        if self.ml_comb_type == 3 or self.ml_comb_type == 4:
+            self.stc_model_type = 1
 
         if self.ml_comb_type == 1:
             self.lang_dim = options.lang_dim  # options.lang_dim = 10(default)
-
-        elif self.ml_comb_type == 2:
+        elif self.ml_comb_type == 2 or self.ml_comb_type == 3 or self.ml_comb_type == 4:
             self.lang_dim = options.lang_dim
             self.lstm_layer_num = options.lstm_layer_num  # 1
             self.lstm_hidden_dim = options.lstm_hidden_dim  # 10
@@ -65,22 +58,25 @@ class m_step_model(nn.Module):
                 self.variational_mu = nn.Linear(self.lstm_hidden_dim * self.lstm_direct * self.lstm_layer_num, self.lstm_direct * self.lstm_hidden_dim)
                 self.variational_logvar = nn.Linear(self.lstm_hidden_dim * self.lstm_direct * self.lstm_layer_num,
                                                     self.lstm_direct * self.lstm_hidden_dim)  # log var.pow(2)
+        if self.ml_comb_type == 3:
+            self.lang_classifier_before = nn.Linear(self.lstm_direct * self.lstm_hidden_dim, self.lang_dim)
+        elif self.ml_comb_type == 4:
+            self.lang_classifier_before = nn.Linear(self.lstm_direct * self.lstm_hidden_dim, self.lang_dim)
+            self.lang_indep_plookup = nn.Embedding(self.tag_num, self.pembedding_dim)
+            self.lang_indep_linear_layer_1 = nn.Linear(self.pembedding_dim, self.hid_dim)
+            self.lang_indep_linear_later_2 = nn.Linear(self.hid_dim, self.hid_dim)
+            self.channel_atten_weight_linear = nn.Linear(self.hid_dim*2, 2)
+
+
         self.plookup = nn.Embedding(self.tag_num, self.pembedding_dim)
-        if self.full_lex:
-            self.p_word_lookup = self.elmo#nn.Embedding(self.word_num, self.pre_output_word_dim)  # pembedding_dim of elmo
-            # self.p_word_lookup.weight.requires_grad = False  # TODO:hanwj
-            self.m_word_lookup = nn.Embedding(self.word_num, self.pre_output_word_dim)  # self.p_word_lookup  # pembedding_dim of elmo
-            self.m_word_lookup.weight.requires_grad = False  # TODO:hanwj
-            self.hid_before_dir = nn.Linear(self.pembedding_dim + self.valency_dim + self.input_word_dim, self.pembedding_dim + self.valency_dim)
         self.dplookup = nn.Embedding(self.tag_num, self.pembedding_dim)
         self.vlookup = nn.Embedding(self.cvalency, self.valency_dim)
         self.dvlookup = nn.Embedding(self.dvalency, self.valency_dim)
         self.head_lstm_embeddings = self.plookup
-        if self.ml_comb_type == 1:
+        if self.ml_comb_type == 1 or self.ml_comb_type == 3 or self.ml_comb_type == 4:
             self.llookup = nn.Embedding(self.lan_num, self.lang_dim)
 
         self.dropout_layer = nn.Dropout(p=self.drop_out)
-
         self.dir_embed = options.dir_embed
         self.dir_dim = options.dir_dim
         if self.dir_embed:
@@ -89,7 +85,7 @@ class m_step_model(nn.Module):
             if self.ml_comb_type == 0:
                 self.left_hid = nn.Linear((self.pembedding_dim + self.valency_dim), self.hid_dim)
                 self.right_hid = nn.Linear((self.pembedding_dim + self.valency_dim), self.hid_dim)
-            elif self.ml_comb_type == 1:
+            elif self.ml_comb_type == 1 or self.ml_comb_type == 3 or self.ml_comb_type == 4:
                 self.left_hid = nn.Linear((self.pembedding_dim + self.valency_dim + self.lang_dim), self.hid_dim)
                 self.right_hid = nn.Linear((self.pembedding_dim + self.valency_dim + self.lang_dim), self.hid_dim)
             elif self.ml_comb_type == 2:
@@ -98,21 +94,10 @@ class m_step_model(nn.Module):
                 self.right_hid = nn.Linear(
                     (self.pembedding_dim + self.valency_dim + self.lstm_direct * self.lstm_hidden_dim),
                     self.hid_dim)
-
-
         else:
             self.hid = nn.Linear((self.pembedding_dim + self.valency_dim + self.dir_dim), self.hid_dim)
-
-        if self.full_lex:
-            self.linear_chd_hid = nn.Linear(self.hid_dim, self.pre_output_dim)
-            self.linear_chd_word_hid = nn.Linear(self.hid_dim, self.pre_output_word_dim)
-            self.pre_word_output = nn.Linear(self.pre_output_word_dim, self.word_num)
-            self.pre_word_output.weight = self.m_word_lookup.weight
-            self.pre_output = nn.Linear(self.pre_output_dim, self.tag_num)
-            # lang_output = torch.mm(lang_output_before, torch.transpose(self.llookup.weight, 0, 1))
-        else:
-            self.linear_chd_hid = nn.Linear(self.hid_dim, self.pre_output_dim)
-            self.pre_output = nn.Linear(self.pre_output_dim, self.tag_num)
+        self.linear_chd_hid = nn.Linear(self.hid_dim, self.pre_output_dim)
+        self.pre_output = nn.Linear(self.pre_output_dim, self.tag_num)
 
         if not self.dir_embed:
             self.left_decision_hid = nn.Linear((self.pembedding_dim + self.valency_dim), self.hid_dim)
@@ -152,7 +137,11 @@ class m_step_model(nn.Module):
     def lang_loss(self, stc_representation, batch_target):
 
         loss = torch.nn.CrossEntropyLoss()
-        lang_output = self.lang_classifier(stc_representation)
+        if self.ml_comb_type == 3:
+            lang_output_before = F.relu(self.lang_classifier_before(stc_representation))
+            lang_output = torch.mm(lang_output_before, torch.transpose(self.llookup.weight,0,1))
+        else:
+            lang_output = self.lang_classifier(stc_representation)
         lang_loss = loss(lang_output, batch_target)
         return lang_loss
 
@@ -184,15 +173,15 @@ class m_step_model(nn.Module):
             var_out = self.reparameterize(self.training, mu, logvar)
             return var_out, -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    def forward_(self, batch_pos, batch_word, batch_index, batch_dir, batch_valence, batch_target, batch_target_word, batch_target_count,
-                 is_prediction, type, em_type, batch_lang_id, sentences_mlist, sentences, sentences_len, epoch):
+    def lang_indep_channel(self, batch_pos):
+        p_embeds = self.lang_indep_plookup(batch_pos)
+        lang_indep_v = self.lang_indep_linear_layer_1(F.relu(p_embeds))
+        lang_indep_v = self.lang_indep_linear_later_2(F.relu(lang_indep_v))
+        return lang_indep_v
+
+    def forward_(self, batch_pos, batch_dir, batch_valence, batch_target, batch_target_count,
+                 is_prediction, type, em_type, batch_lang_id, sentences, sentences_len, epoch):
         p_embeds = self.plookup(batch_pos)
-        if self.full_lex:
-            sentences_mlist = [[self.i2word[j] for j in i] for i in sentences_mlist]
-            batch_ws_id = batch_to_ids(sentences_mlist)
-            batch_ws_emb = self.elmo(batch_ws_id)
-            pw_embeds = batch_ws_emb['elmo_representations'][0][range(len(batch_index)), batch_index, :]
-            # pw_embeds = self.p_word_lookup(batch_word)
         if type == 'child':
             v_embeds = self.vlookup(batch_valence)
         else:
@@ -217,9 +206,21 @@ class m_step_model(nn.Module):
                 input_embeds = torch.cat((p_embeds, v_embeds, stc_representation), 1)
                 if not is_prediction:
                     lang_cls_loss = self.lang_loss(stc_representation, batch_lang_id)
-            if self.full_lex:
-                input_embeds = torch.cat((input_embeds, pw_embeds), 1)
-                input_embeds = F.relu(self.hid_before_dir(input_embeds))
+            elif self.ml_comb_type == 3:
+                lang_embeds = self.llookup(batch_lang_id)
+                input_embeds = torch.cat((p_embeds, v_embeds, lang_embeds), 1)
+                stc_representation_and_vae_loss = self.stc_representation(sentences, sentences_len, p_embeds)
+                stc_representation = stc_representation_and_vae_loss[0] if isinstance(stc_representation_and_vae_loss,
+                                                                                      tuple) else stc_representation_and_vae_loss
+                if not is_prediction:
+                    lang_cls_loss = self.lang_loss(stc_representation, batch_lang_id)
+            elif self.ml_comb_type == 4:
+                lang_embeds = self.llookup(batch_lang_id)
+                input_embeds = torch.cat((p_embeds, v_embeds, lang_embeds), 1)
+                stc_representation_and_vae_loss = self.stc_representation(sentences, sentences_len, p_embeds)
+                stc_representation = stc_representation_and_vae_loss[0] if isinstance(stc_representation_and_vae_loss, tuple) else stc_representation_and_vae_loss
+                if not is_prediction:
+                    lang_cls_loss = self.lang_loss(stc_representation, batch_lang_id)
             input_embeds = self.dropout_layer(input_embeds)
             left_v = self.left_hid(input_embeds)
             left_v = F.relu(left_v)
@@ -228,13 +229,23 @@ class m_step_model(nn.Module):
             left_v = left_v.masked_fill(left_mask, 0.0)
             right_v = right_v.masked_fill(right_mask, 0.0)
             hidden_v = left_v + right_v
+            if self.ml_comb_type == 4:
+                lang_indep_hidden_v = self.lang_indep_channel(batch_pos)
+                if self.channel_type == 0:  # 0 mul 1 add 2 mul+gate 3 add+gate
+                    hidden_v = hidden_v * lang_indep_hidden_v #
+                elif self.channel_type == 1:
+                    hidden_v = hidden_v + lang_indep_hidden_v
+                elif self.channel_type == 2:
+                    channel_atten_weight = F.softmax(self.channel_atten_weight_linear(torch.cat((lang_indep_hidden_v, hidden_v), dim=1)))
+                    hidden_v = (lang_indep_hidden_v * channel_atten_weight[:,0:1].expand(lang_indep_hidden_v.size()[0], lang_indep_hidden_v.size()[1])) * (hidden_v * channel_atten_weight[:,1:2].expand(hidden_v.size()[0], hidden_v.size()[1]))
+                elif self.channel_type == 3:
+                    channel_atten_weight = F.softmax(self.channel_atten_weight_linear(torch.cat((lang_indep_hidden_v, hidden_v), dim=1)))
+                    hidden_v = (lang_indep_hidden_v * channel_atten_weight[:, 0:1].expand(lang_indep_hidden_v.size()[0], lang_indep_hidden_v.size()[1])) + (hidden_v * channel_atten_weight[:, 1:2].expand(hidden_v.size()[0], hidden_v.size()[1]))
         else:
             input_embeds = torch.cat((p_embeds, v_embeds, d_embeds), 1)
             hidden_v = self.hid(input_embeds)
         if type == 'child':
             pre_output_v = self.pre_output(F.relu(self.linear_chd_hid(hidden_v)))
-            if self.full_lex:
-                pre_output_word_v = self.pre_word_output(F.relu(self.linear_chd_word_hid(hidden_v)))
         else:
             pre_output_v = self.decision_pre_output(F.relu(self.linear_decision_hid(hidden_v)))
         if not is_prediction:
@@ -248,21 +259,16 @@ class m_step_model(nn.Module):
                 target_prob = torch.gather(predicted_prob, 1, batch_target)
                 batch_target_count = batch_target_count.view(len(batch_target_count), 1)
                 batch_loss = -torch.sum(batch_target_count * target_prob)
-                if self.full_lex:
-                    predicted_word_prob = F.log_softmax(pre_output_word_v, dim=1)
-                    batch_target_word = batch_target_word.view(len(batch_target_word), 1)
-                    target_word_prob = torch.gather(predicted_word_prob, 1, batch_target_word)
-                    batch_loss += -torch.sum(batch_target_count * target_word_prob)
-
                 if self.ml_comb_type == 2:
+                    batch_loss += lang_cls_loss
+                if self.ml_comb_type == 3 or (self.ml_comb_type == 4 and self.channel_add_lang_cls == 1):
                     batch_loss += lang_cls_loss
                 if self.stc_model_type == 3:
                     batch_loss += vae_loss
                 return batch_loss
         else:
             predicted_param = F.softmax(pre_output_v, dim=1)
-            predicted_word_param = F.softmax(pre_output_word_v, dim=1) if self.full_lex else None
-            return predicted_param, predicted_word_param
+            return predicted_param
 
     def forward_decision(self, batch_decision_pos, batch_decision_dir, batch_dvalence, batch_target_decision,
                          batch_target_decision_count, is_prediction, em_type):
@@ -315,72 +321,36 @@ class m_step_model(nn.Module):
         right_mask = right_mask.expand(-1, self.hid_dim)
         return left_mask, right_mask
 
-    # estimate parameters of e-step
     def predict(self, sentence_trans_param, root_param, decision_param, batch_size, trans_counter, root_counnter, decision_counter,
-                sentence_map, sentence_word_map, language_map, languages, epoch):
-        s_len, _, cvalency = sentence_trans_param[0].shape  # h c v
+                sentence_map, language_map, languages, epoch):
+        _, input_pos_num, target_pos_num, dir_num, cvalency = sentence_trans_param.shape
         input_decision_pos_num, decision_dir_num, dvalency, target_decision_num = decision_param.shape
-        # input_trans_list = [[p, cv] for p in range(input_pos_num) for cv in range(cvalency)]
-        # batched_input_trans = utils.construct_update_batch_data(input_trans_list, batch_size)
-        # trans_batch_num = len(batched_input_trans)
+        input_trans_list = [[p, d, cv] for p in range(input_pos_num) for d in range(dir_num) for cv in range(cvalency)]
+        input_decision_list = [[p, d, dv] for p in range(input_decision_pos_num) for d in range(dir_num) for dv in
+                               range(dvalency)]
 
+        batched_input_trans = utils.construct_update_batch_data(input_trans_list, batch_size)
+        batched_input_decision = utils.construct_update_batch_data(input_decision_list, batch_size)
+        trans_batch_num = len(batched_input_trans)
+        decision_batch_num = len(batched_input_decision)
         for s in range(len(sentence_map)):
-            # Update transition parameters
-            batch_target_lan_v = torch.LongTensor([languages[language_map[s]]]).expand(len(sentence_map[s])**2)  # TODO hanwj
-            batch_input_len = torch.LongTensor([len(sentence_map[s])]).expand(len(sentence_map[s])**2)
-            batch_input_sen_v = torch.LongTensor([sentence_map[s]]).expand(len(sentence_map[s])**2, len(sentence_map[s]))
-            batch_input_sen_v_mlist = torch.LongTensor([sentence_word_map[s]]).expand(len(sentence_word_map[s])**2, len(sentence_word_map[s]))
-            batch_input_sen_word_v = torch.LongTensor([sentence_word_map[s]]).expand(len(sentence_map[s])**2, len(sentence_word_map[s]))
-            one_batch_input_pos = torch.LongTensor([sentence_map[s][h] for h in range(len(sentence_map[s])) for _ in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_input_word = torch.LongTensor([sentence_word_map[s][h] for h in range(len(sentence_word_map[s])) for c in range(len(sentence_word_map[s])) for v in range(cvalency)])
-            one_batch_output_pos = torch.LongTensor([sentence_map[s][c] for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_output_word = torch.LongTensor([sentence_word_map[s][c] for h in range(len(sentence_word_map[s])) for c in range(len(sentence_word_map[s])) for v in range(cvalency)])
-            one_batch_dir = torch.LongTensor([1 if h<c else 0 for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_cvalency = torch.LongTensor([v for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_input_tag_index = np.array([h for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_input_word_index = np.array([h for h in range(len(sentence_word_map[s])) for c in range(len(sentence_word_map[s])) for v in range(cvalency)])
-            one_batch_output_tag_index = np.array([c for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_output_word_index = np.array([c for h in range(len(sentence_word_map[s])) for c in range(len(sentence_word_map[s])) for v in range(cvalency)])
-            one_batch_dir_index = np.array([1 if h<c else 0 for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            one_batch_cvalency_index = np.array([v for h in range(len(sentence_map[s])) for c in range(len(sentence_map[s])) for v in range(cvalency)])
-            predicted_trans_param, predicted_trans_param_word = self.forward_(one_batch_input_pos, one_batch_input_word, one_batch_input_word_index, one_batch_dir, one_batch_cvalency,
-                                                  None, None, None, True, 'child',
-                                                  self.em_type, batch_target_lan_v, batch_input_sen_v_mlist, batch_input_sen_v,
-                                                  batch_input_len, epoch=epoch)
-            if self.full_lex:
-                sentence_trans_param[s][one_batch_input_word_index, one_batch_output_word_index, one_batch_cvalency_index] = predicted_trans_param_word.detach().numpy()[range((len(sentence_word_map[s])**2)*cvalency), one_batch_output_word]  # .reshape(one_batch_size, target_pos_num, 1, 1)
-            else:
-                sentence_trans_param[s][one_batch_input_tag_index, one_batch_output_tag_index, one_batch_cvalency_index] = predicted_trans_param.detach().numpy()[range((len(sentence_map[s])**2)*cvalency), one_batch_output_pos]  # .reshape(one_batch_size, target_pos_num, 1, 1)
-
-
-        # _, input_pos_num, target_pos_num, dir_num, cvalency = sentence_trans_param.shape
-        # input_decision_pos_num, decision_dir_num, dvalency, target_decision_num = decision_param.shape
-        # input_trans_list = [[p, d, cv] for p in range(input_pos_num) for d in range(dir_num) for cv in range(cvalency)]
-        # input_decision_list = [[p, d, dv] for p in range(input_decision_pos_num) for d in range(dir_num) for dv in
-        #                        range(dvalency)]
-        #
-        # batched_input_trans = utils.construct_update_batch_data(input_trans_list, batch_size)
-        # batched_input_decision = utils.construct_update_batch_data(input_decision_list, batch_size)
-        # trans_batch_num = len(batched_input_trans)
-        # decision_batch_num = len(batched_input_decision)
-        # for s in range(len(sentence_map)):
-        #     for i in range(trans_batch_num):
-        #         # Update transition parameters
-        #         one_batch_size = len(batched_input_trans[i])
-        #         batch_target_lan_v = torch.LongTensor([languages[language_map[s]]]).expand(one_batch_size)  # TODO hanwj
-        #         batch_input_len = torch.LongTensor([len(sentence_map[s])]).expand(one_batch_size)
-        #         batch_input_sen_v = torch.LongTensor([sentence_map[s]]).expand(one_batch_size, len(sentence_map[s]))
-        #         one_batch_input_pos = torch.LongTensor(batched_input_trans[i])[:, 0]
-        #         one_batch_dir = torch.LongTensor(batched_input_trans[i])[:, 1]
-        #         one_batch_cvalency = torch.LongTensor(batched_input_trans[i])[:, 2]
-        #         one_batch_input_pos_index = np.array(batched_input_trans[i])[:, 0]
-        #         one_batch_dir_index = np.array(batched_input_trans[i])[:, 1]
-        #         one_batch_cvalency_index = np.array(batched_input_trans[i])[:, 2]
-        #         predicted_trans_param = self.forward_(one_batch_input_pos, one_batch_dir, one_batch_cvalency,
-        #                                               None, None, None, True, 'child',
-        #                                               self.em_type, batch_target_lan_v, batch_input_sen_v,
-        #                                               batch_input_len, epoch=epoch)
-        #         sentence_trans_param[s][one_batch_input_pos_index, :, one_batch_dir_index, one_batch_cvalency_index] = predicted_trans_param.detach().numpy()#.reshape(one_batch_size, target_pos_num, 1, 1)
+            for i in range(trans_batch_num):
+                # Update transition parameters
+                one_batch_size = len(batched_input_trans[i])
+                batch_target_lan_v = torch.LongTensor([languages[language_map[s]]]).expand(one_batch_size)  # TODO hanwj
+                batch_input_len = torch.LongTensor([len(sentence_map[s])]).expand(one_batch_size)
+                batch_input_sen_v = torch.LongTensor([sentence_map[s]]).expand(one_batch_size, len(sentence_map[s]))
+                one_batch_input_pos = torch.LongTensor(batched_input_trans[i])[:, 0]
+                one_batch_dir = torch.LongTensor(batched_input_trans[i])[:, 1]
+                one_batch_cvalency = torch.LongTensor(batched_input_trans[i])[:, 2]
+                one_batch_input_pos_index = np.array(batched_input_trans[i])[:, 0]
+                one_batch_dir_index = np.array(batched_input_trans[i])[:, 1]
+                one_batch_cvalency_index = np.array(batched_input_trans[i])[:, 2]
+                predicted_trans_param = self.forward_(one_batch_input_pos, one_batch_dir, one_batch_cvalency,
+                                                      None, None, True, 'child',
+                                                      self.em_type, batch_target_lan_v, batch_input_sen_v,
+                                                      batch_input_len, epoch=epoch)
+                sentence_trans_param[s][one_batch_input_pos_index, :, one_batch_dir_index, one_batch_cvalency_index] = predicted_trans_param.detach().numpy()#.reshape(one_batch_size, target_pos_num, 1, 1)
         # TODO:
         # if not child_only:
         #     for i in range(decision_batch_num):

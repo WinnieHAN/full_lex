@@ -15,7 +15,7 @@ class ConllEntry:
         self.form = form
         self.norm = normalize(form)
         self.cpos = cpos.upper()
-        self.pos = pos.upper()
+        self.pos = pos.upper()  # what we actually use.
         self.parent_id = parent_id
         self.relation = relation
 
@@ -142,8 +142,8 @@ class data_sentence:
         pos_list = list()
         for entry in self.entries:
             if words is not None:
-                if entry.norm in words.keys():
-                    word_list.append(words[entry.norm])
+                if entry.norm in words.keys():  # TODO:hanwj
+                    word_list.append(words[entry.norm])  # TODO:hanwj
                 else:
                     word_list.append(words['<UNKNOWN>'])
             if entry.pos in pos.keys():
@@ -192,42 +192,45 @@ def read_conll(fh):
             else:
                 # if tok[3][0] == 'V':
                 #    tok[3] = "V"
-                tokens.append(ConllEntry(int(tok[0]), tok[1], tok[2], tok[4], tok[3], tok[5],
-                                         int(tok[6]) if tok[6] != '_' else -1, tok[7], tok[8], tok[9]))
+                index = 0 if tok[0] == 'x' else int(tok[0])  # TODO:hanwj
+                tokens.append(ConllEntry(index, tok[1], tok[2], tok[3], tok[4], tok[5],
+                                         int(tok[6]) if tok[6] != '_' else -1))
+                # tokens.append(ConllEntry(index, tok[1], tok[2], tok[4], tok[3], tok[5],
+                #                          int(tok[6]) if tok[6] != '_' else -1, tok[7], tok[8], tok[9]))
     if len(tokens) > 0:
         yield tokens
 
 
-def read_data(conll_path, isPredict):
-    sentences = []
-    if not isPredict:
-        wordsCount = Counter()
-        posCount = Counter()
-        s_counter = 0
-        with open(conll_path, 'r') as conllFP:
-            for sentence in read_conll(conllFP):
-                wordsCount.update([node.norm for node in sentence if isinstance(node, ConllEntry)])
-                posCount.update([node.pos for node in sentence if isinstance(node, ConllEntry)])
-                ds = data_sentence(s_counter, sentence)
-                sentences.append(ds)
-                s_counter += 1
-        wordsCount['<UNKNOWN>'] = 0
-        # posCount['<UNKNOWN-POS>'] = 0
-        return {w: i for i, w in enumerate(wordsCount.keys())}, {p: i for i, p in enumerate(
-            posCount.keys())}, sentences
-    else:
-        with open(conll_path, 'r') as conllFP:
-            s_counter = 0
-            for sentence in read_conll(conllFP):
-                ds = data_sentence(s_counter, sentence)
-                sentences.append(ds)
-                s_counter += 1
-        return sentences
+# def read_data(conll_path, isPredict):
+#     sentences = []
+#     if not isPredict:
+#         wordsCount = Counter()
+#         posCount = Counter()
+#         s_counter = 0
+#         with open(conll_path, 'r') as conllFP:
+#             for sentence in read_conll(conllFP):
+#                 wordsCount.update([node.norm for node in sentence if isinstance(node, ConllEntry)])
+#                 posCount.update([node.pos for node in sentence if isinstance(node, ConllEntry)])
+#                 ds = data_sentence(s_counter, sentence)
+#                 sentences.append(ds)
+#                 s_counter += 1
+#         wordsCount['<UNKNOWN>'] = 0
+#         # posCount['<UNKNOWN-POS>'] = 0
+#         return {w: i for i, w in enumerate(wordsCount.keys())}, {p: i for i, p in enumerate(
+#             posCount.keys())}, sentences
+#     else:
+#         with open(conll_path, 'r') as conllFP:
+#             s_counter = 0
+#             for sentence in read_conll(conllFP):
+#                 ds = data_sentence(s_counter, sentence)
+#                 sentences.append(ds)
+#                 s_counter += 1
+#         return sentences
 
 
 def construct_batch_data(data_list, batch_size):
-    data_list.sort(key=lambda x: len(x[0]))
-    grouped = [list(g) for k, g in groupby(data_list, lambda s: len(s[0]))]
+    data_list.sort(key=lambda x: len(x[0][0]))
+    grouped = [list(g) for k, g in groupby(data_list, lambda s: len(s[0][0]))]
     batch_data = []
     for group in grouped:
         sub_batch_data = get_batch_data(group, batch_size)
@@ -280,7 +283,7 @@ def eval(predicted, gold, test_path, log_path, epoch):
                 correct_counter += 1
             total_counter += 1
     accuracy = float(correct_counter) / total_counter
-    print 'UAS is ' + str(accuracy * 100) + '%'
+    print('UAS is ' + str(accuracy * 100) + '%')
     f_w = open(test_path, 'w')
     for s, sentence in enumerate(gold):
         for entry in sentence.entries:
@@ -482,12 +485,13 @@ def read_multiple_data(file_set, isPredict, isadd):
              'la_proiel',
              'lv', 'no', 'cu', 'fa', 'pl', 'pt', 'pt_bosque', 'pt_br', 'ro', 'ru', 'ru_syntagrus', 'sa', 'sk',
              'sl',
-             'sl_sst', 'es', 'es_ancora', 'sv', 'sv_lines', 'swl', 'ta', 'tr', 'uk', 'ug', 'vi'])
+             'sl_sst', 'es', 'es_ancora', 'sv', 'sv_lines', 'swl', 'ta', 'tr', 'uk', 'ug', 'vi', 'wsj'])
         langs2i = {i: j for j, i in enumerate(langs)}
         i2langs = {i: j for j, i in langs2i.items()}
 
     sentences = []
     if not isPredict:
+        wordCount = Counter()
         posCount = Counter()
         lanCounter = Counter()
         language_map = {}
@@ -498,15 +502,17 @@ def read_multiple_data(file_set, isPredict, isadd):
             with open(one_data_path, 'r') as conllFP:
                 for sentence in read_conll(conllFP):
                     posCount.update([node.pos for node in sentence if isinstance(node, ConllEntry)])
+                    wordCount.update([node.norm for node in sentence if isinstance(node, ConllEntry)])  # TODO:hanwj .norm
                     ds = data_sentence(s_counter, sentence)
                     sentences.append(ds)
                     language_map[s_counter] = language_key
                     lanCounter.update([language_key])  # lang2i
                     s_counter += 1
+        wordCount.update(['<UNKNOWN>'])
         if not isadd:
-            return {p: i for i, p in enumerate(posCount.keys())}, sentences, {l: i for i, l in enumerate(lanCounter.keys())}, language_map  # pos: str 2 id, sentences, languages: lang 2 id, language_map: id 2 lang
+            return {p: i for i, p in enumerate(wordCount.keys())}, {p: i for i, p in enumerate(posCount.keys())}, sentences, {l: i for i, l in enumerate(lanCounter.keys())}, language_map  # words: str2id  pos: str2id, sentences, languages: lang2id, language_map: id2lang
         else:
-            return {p: i for i, p in enumerate(posCount.keys())}, sentences, langs2i, language_map
+            return {p: i for i, p in enumerate(wordCount.keys())}, {p: i for i, p in enumerate(posCount.keys())}, sentences, langs2i, language_map
     else:
         for file in file_set:
             one_data_path = file
@@ -545,15 +551,18 @@ def construct_ml_input_data(rule_samples, decision_samples, sentence_map, sample
     batch_target_data = {}
     batch_decision_data = {}
     batch_target_decision_data = {}
-    batch_rule_samples = construct_ml_batch_data(rule_samples, sentence_map, sample_batch_size, 4)
-    batch_decision_samples = construct_ml_batch_data(decision_samples, sentence_map, sample_batch_size, 4)
+    batch_rule_samples = construct_ml_batch_data(rule_samples, sentence_map, sample_batch_size, 7)
+    batch_decision_samples = []#construct_ml_batch_data(decision_samples, sentence_map, sample_batch_size, 6)
     batch_input_pos_list = list()
+    batch_input_word_list = list()
+    batch_input_index_list = list()
     batch_input_dir_list = list()
     batch_input_sen_list = list()
     batch_cvalency_list = list()
     batch_dvalency_list = list()
     batch_lan_list = list()
     batch_target_pos_list = list()
+    batch_target_word_list = list()
     batch_decision_pos_list = list()
     batch_decision_dir_list = list()
     batch_decision_sen_list = list()
@@ -566,25 +575,34 @@ def construct_ml_input_data(rule_samples, decision_samples, sentence_map, sample
     for i in range(len(batch_rule_samples)):
         one_batch = np.array(batch_rule_samples[i])
         one_batch_input_pos = one_batch[:, 0]
-        one_batch_input_dir = one_batch[:, 2]
-        one_batch_cvalency = one_batch[:, 3]
-        one_batch_sentence = one_batch[:, 4]
-        one_batch_target_pos = one_batch[:, 1]
-        one_batch_target_lan = one_batch[:, 5]
+        one_batch_input_word = one_batch[:, 1]
+        one_batch_input_index = one_batch[:, 2]
+        one_batch_input_dir = one_batch[:, 5]
+        one_batch_cvalency = one_batch[:, 6]
+        one_batch_sentence = one_batch[:, 7]
+        one_batch_target_pos = one_batch[:, 3]
+        one_batch_target_word = one_batch[:, 4]
+        one_batch_target_lan = one_batch[:, 8]
         batch_input_pos_list.append(one_batch_input_pos)
+        batch_input_word_list.append(one_batch_input_word)
+        batch_input_index_list.append(one_batch_input_index)
         batch_input_dir_list.append(one_batch_input_dir)
         batch_cvalency_list.append(one_batch_cvalency)
         batch_input_sen_list.append(one_batch_sentence)
         batch_target_pos_list.append(one_batch_target_pos)
+        batch_target_word_list.append(one_batch_target_word)
         batch_lan_list.append(one_batch_target_lan)
         if em_type == 'em':
-            one_batch_target_count = one_batch[:, 6]
+            one_batch_target_count = one_batch[:, 9]
             batch_target_count_list.append(one_batch_target_count)
     batch_input_data['input_pos'] = batch_input_pos_list
+    batch_input_data['input_word'] = batch_input_word_list
+    batch_input_data['input_index'] = batch_input_index_list
     batch_input_data['input_dir'] = batch_input_dir_list
     batch_input_data['cvalency'] = batch_cvalency_list
     batch_input_data['sentence'] = batch_input_sen_list
     batch_target_data['target_pos'] = batch_target_pos_list
+    batch_target_data['target_word'] = batch_target_word_list
     batch_target_data['target_lan'] = batch_lan_list
     if em_type == 'em':
         batch_target_data['target_count'] = batch_target_count_list
@@ -654,14 +672,14 @@ def language_bank(currPath, names, stc_length, isPredict):
                             'UD_Sanskrit', 'UD_Slovak', 'UD_Slovenian', 'UD_Slovenian-SST', 'UD_Spanish',
                             'UD_Spanish-AnCora',
                             'UD_Swedish', 'UD_Swedish-LinES', 'UD_Swedish_Sign_Language', 'UD_Tamil', 'UD_Turkish',
-                            'UD_Ukrainian', 'UD_Uyghur', 'UD_Vietnamese'])
+                            'UD_Ukrainian', 'UD_Uyghur', 'UD_Vietnamese', 'WSJ'])
     langs = np.array(['grc', 'grc_proiel', 'ar', 'eu', 'bg', 'ca', 'zh', 'cop', 'hr', 'cs', 'cs_cac', 'cs_cltt', 'da',
                       'nl', 'nl_lassysmall', 'en', 'en_esl', 'en_lines', 'et', 'fi', 'fi_ftb', 'fr', 'gl', 'gl_treegal',
                       'de', 'got', 'el', 'he', 'hi', 'hu', 'id', 'ga', 'it', 'ja', 'ja_ktc', 'kk', 'la', 'la_ittb',
                       'la_proiel',
                       'lv', 'no', 'cu', 'fa', 'pl', 'pt', 'pt_bosque', 'pt_br', 'ro', 'ru', 'ru_syntagrus', 'sa', 'sk',
                       'sl',
-                      'sl_sst', 'es', 'es_ancora', 'sv', 'sv_lines', 'swl', 'ta', 'tr', 'uk', 'ug', 'vi'])
+                      'sl_sst', 'es', 'es_ancora', 'sv', 'sv_lines', 'swl', 'ta', 'tr', 'uk', 'ug', 'vi', 'wsj'])
     train_or_test = 'test' if isPredict else 'train'
     langs2i = {i:j for j,i in enumerate(langs)}
     for i in names:
